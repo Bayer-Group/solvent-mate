@@ -1,6 +1,9 @@
+from sklearn.model_selection import GridSearchCV
 from solvmate import *
 from solvmate.ranksolv import ood
 from solvmate.ranksolv.featurizer import (
+    CDDDFeaturizer,
+    CombinedFeaturizer,
     CountECFPFeaturizer,
     ECFPFeaturizer,
     ECFPSolventOnlyFeaturizer,
@@ -137,25 +140,37 @@ class RecommenderFactory:
 
         if featurizers is None:
             featurizers = [
-                # CosmoRSFeaturizer(
-                #    phase="train",
-                #    pairwise_reduction="concat",
-                #    feature_name="cosmors",
-                # ),
-                HybridFeaturizer(
+                CosmoRSFeaturizer(
+                    phase="train",
+                    pairwise_reduction="concat",
+                    feature_name="cosmors",
+                ),
+                CosmoRSFeaturizer(
                     phase="train",
                     pairwise_reduction="diff",
-                    feature_name="hybrid",
-                    xtb_featurizer=XTBFeaturizer(
-                        phase="train",
-                        pairwise_reduction="diff",
-                        feature_name="xtb",
-                    ),
-                    ecfp_featurizer=CountECFPFeaturizer(
-                        phase="train",
-                        pairwise_reduction="diff",
-                        feature_name="ecfp_count",
-                    ),
+                    feature_name="cosmors",
+                ),
+                # Brings nothing. 
+                # Therefore removed to keep discussion simpler:
+                # HybridFeaturizer(
+                    # phase="train",
+                    # pairwise_reduction="diff",
+                    # feature_name="hybrid",
+                    # xtb_featurizer=XTBFeaturizer(
+                        # phase="train",
+                        # pairwise_reduction="diff",
+                        # feature_name="xtb",
+                    # ),
+                    # ecfp_featurizer=CountECFPFeaturizer(
+                        # phase="train",
+                        # pairwise_reduction="diff",
+                        # feature_name="ecfp_count",
+                    # ),
+                # ),
+                RandFeaturizer(
+                    phase="train",
+                    pairwise_reduction="concat",
+                    feature_name="rand",
                 ),
                 RandFeaturizer(
                     phase="train",
@@ -167,10 +182,23 @@ class RecommenderFactory:
                     pairwise_reduction="concat",
                     feature_name="prior",
                 ),
+                PriorFeaturizer(
+                    phase="train",
+                    pairwise_reduction="diff",
+                    feature_name="prior",
+                ),
                 ECFPSolventOnlyFeaturizer(
                     phase="train",
                     pairwise_reduction="concat",
                     feature_name="ecfp_solv",
+                ),
+                ECFPSolventOnlyFeaturizer(
+                    phase="train",
+                    pairwise_reduction="diff",
+                    feature_name="ecfp_solv",
+                ),
+                CountECFPFeaturizer(
+                    phase="train", pairwise_reduction="concat", feature_name="ecfp_count"
                 ),
                 CountECFPFeaturizer(
                     phase="train", pairwise_reduction="diff", feature_name="ecfp_count"
@@ -180,10 +208,21 @@ class RecommenderFactory:
                     pairwise_reduction="diff",
                     feature_name="xtb",
                 ),
+                XTBFeaturizer(
+                    phase="train",
+                    pairwise_reduction="concat",
+                    feature_name="xtb",
+                ),
                 ECFPFeaturizer(
                     phase="train", pairwise_reduction="diff", feature_name="ecfp_bit"
                 ),
+                ECFPFeaturizer(
+                    phase="train", pairwise_reduction="concat", feature_name="ecfp_bit"
+                ),
+                CDDDFeaturizer(feature_name="cddd",phase="train",pairwise_reduction="concat"),
+                CDDDFeaturizer(feature_name="cddd",phase="train",pairwise_reduction="diff"),
             ]
+
         self.featurizers = featurizers
 
         if abs_strat_range is None:
@@ -216,6 +255,7 @@ class RecommenderFactory:
         save_recommender: bool,
         job_name: str,
         only_source: str,
+        eval_on_ood: bool,
     ):
 
         td = get_training_data()
@@ -225,7 +265,7 @@ class RecommenderFactory:
             bool(nova_as_ood) and bool(only_source)
         ), "nova_as_ood can only be set without only_source option!"
         if only_source:
-            print("only considereing source: ", only_source)
+            print("only considering source: ", only_source)
             print("train data before:", len(td))
             td = td[td.source == only_source]
             print("train data after:", len(td))
@@ -256,18 +296,18 @@ class RecommenderFactory:
             ood_data["solute SMILES"].unique().tolist(), top_pairs
         )
 
-        if os.environ.get("_SM_ONLY_COSMO_CALCULATED_SMILES"):
-            warn("replacing ood_pairs by normal pairs")
-            ood_data = td
-            ood_pairs = pairs
+        #if os.environ.get("_SM_ONLY_COSMO_CALCULATED_SMILES"):
+        #warn("replacing ood_pairs by normal pairs")
+        #ood_data = td
+        #ood_pairs = pairs
 
         if perform_cv:
-            add_cross_fold_by_col(pairs, col="solute SMILES")
+            add_cross_fold_by_col(pairs, col="solute SMILES",random_seed=123,)
 
         if perform_butina_cv:
             pairs = pairs[~pairs["solute SMILES"].isna()]
             pairs = pairs[~pairs["solute SMILES"].apply(Chem.MolFromSmiles).isna()]
-            add_cv_by_butina_clustering(pairs, col="solute SMILES")
+            add_cv_by_butina_clustering(pairs, col="solute SMILES",random_seed=123,)
 
         # if perform_solvent_cv:
         # pairs = apply_solvent_cv(pairs)
@@ -427,20 +467,26 @@ class RecommenderFactory:
                             mean_kendalltau_test = kts.mean()
                             std_kendalltau_test = kts.std(ddof=1)
 
-                            if os.environ.get("_SM_DO_OOD_EVAL"):
-                                ood_stats = ood.eval_on_ood_data(
-                                    data=ood_data, pairs=ood_pairs, rec=rc
-                                )
+                            if eval_on_ood:
+                                if not nova_as_ood and featurizer.__class__.__name__ == CosmoRSFeaturizer.__name__:
+                                    info("cosmors featurizer+Bayer OOD is not evaluated. ")
+                                    ood_stats = ood.StatsOOD(
+                                        r_spearman=np.nan, r_kendalltau=np.nan
+                                    )
+                                else:
+                                    ood_stats = ood.eval_on_ood_data(
+                                        data=ood_data, pairs=ood_pairs, rec=rc
+                                    )
                             else:
-                                info(
-                                    "skipping ood eval. To perform it, set _SM_DO_OOD_EVAL environment flag"
-                                )
+                                #info(
+                                #"skipping ood eval. To perform it, set _SM_DO_OOD_EVAL environment flag"
+                                #)
                                 ood_stats = ood.StatsOOD(
                                     r_spearman=np.nan, r_kendalltau=np.nan
                                 )
 
                             stats_dct = {
-                                "reg": str(reg),
+                                "reg": str(reg.estimator) if is_cv_instance(reg,) else str(reg),
                                 "featurizer": str(featurizer),
                                 "feature_name": featurizer.feature_name,
                                 "pairwise_reduction": featurizer.pairwise_reduction,
